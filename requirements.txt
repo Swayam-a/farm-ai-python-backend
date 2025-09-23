@@ -1,5 +1,9 @@
 fastapi
 uvicorn
-supabase
 python-dotenv
+supabase
 pydantic
+numpy
+opencv-python-headless
+scikit-learn
+python-multipart

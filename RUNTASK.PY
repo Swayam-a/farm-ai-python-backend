@@ -1,142 +1,99 @@
 import os
-import uuid
-import subprocess
-import shutil
+import io
 import traceback
-from fastapi import FastAPI, HTTPException, Security
-from fastapi.security import APIKeyHeader
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
-from supabase import create_client, Client
 import uvicorn
+import numpy as np
+import cv2 # OpenCV for image processing
+from sklearn.cluster import KMeans
 
 # --- 1. Configuration and Initialization ---
 load_dotenv()
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-SERVER_API_KEY = os.getenv("SERVER_API_KEY")
-
-if not all([SUPABASE_URL, SUPABASE_KEY, SERVER_API_KEY]):
-    raise ValueError("FATAL ERROR: Missing required environment variables. Check your .env file.")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI(title="Vegetation Health Mapping API")
 
-API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
+# --- 2. Image Processing Core Logic (Replaces MATLAB) ---
 
-# --- 2. API Key Authentication ---
-async def get_api_key(api_key: str = Security(api_key_header)):
-    if api_key == SERVER_API_KEY:
-        return api_key
-    else:
-        raise HTTPException(status_code=403, detail="Could not validate API credentials.")
+def calculate_ndvi(rgb_image, nir_image):
+    """Calculates the NDVI map from RGB and NIR image arrays."""
+    # The NIR band is a single channel (grayscale)
+    nir = nir_image.astype(np.float32)
+    # The Red band is the last channel in the RGB image when read by OpenCV (BGR order)
+    red = rgb_image[:, :, 2].astype(np.float32)
 
-# --- 3. Request Data Model ---
-class ImageProcessRequest(BaseModel):
-    rgb_image_path: str
-    nir_image_path: str
-
-
-# --- 4. Local Testing Endpoint ---
-@app.post("/process-local-images/")
-def process_local_images():
-    print("--- Starting Local Processing Job ---")
-    project_path = os.getcwd()
-    local_data_dir = os.path.join(project_path, "local_test_data")
-    output_dir = os.path.join(project_path, "local_outputs")
-    os.makedirs(output_dir, exist_ok=True)
-
-    local_rgb_path = os.path.abspath(os.path.join(local_data_dir, "test_rgb.jpg"))
-    local_nir_path = os.path.abspath(os.path.join(local_data_dir, "test_nir.jpg"))
+    # Prevent division by zero
+    np.seterr(divide='ignore', invalid='ignore')
     
-    if not os.path.exists(local_rgb_path) or not os.path.exists(local_nir_path):
-        raise HTTPException(
-            status_code=404, 
-            detail="Local test images not found. Place 'test_rgb.jpg' and 'test_nir.jpg' in the 'local_test_data' folder."
-        )
+    # Calculate NDVI: (NIR - Red) / (NIR + Red)
+    denominator = (nir + red)
+    ndvi = np.where(denominator == 0, 0, (nir - red) / denominator)
+    return ndvi
 
-    job_id = str(uuid.uuid4())
-    local_output_path = os.path.abspath(os.path.join(output_dir, f"local_map_{job_id}.png"))
+def create_health_map(ndvi_map):
+    """Applies K-Means clustering and creates a color-coded health map."""
+    # Reshape the 2D NDVI map into a 1D array of pixels for clustering
+    pixels = ndvi_map.reshape((-1, 1))
 
+    # K-Means Clustering to identify 3 zones (Healthy, Stressed, Highly Stressed)
+    kmeans = KMeans(n_clusters=3, random_state=0, n_init=10).fit(pixels)
+    labels = kmeans.labels_
+    
+    # Find which cluster corresponds to Healthy (highest NDVI), Stressed, etc.
+    centers = kmeans.cluster_centers_.flatten()
+    sorted_centers_indices = np.argsort(centers)
+    
+    # Define colors for each zone (in BGR format for OpenCV)
+    # You can adjust these colors to your preference
+    HEALTHY_COLOR = [0, 255, 0]       # Green
+    STRESSED_COLOR = [0, 255, 255]    # Yellow
+    HIGHLY_STRESSED_COLOR = [0, 0, 255] # Red
+
+    # Create a mapping from sorted cluster index to color
+    color_map = np.array([HIGHLY_STRESSED_COLOR, STRESSED_COLOR, HEALTHY_COLOR], dtype=np.uint8)
+    
+    # Create the final color-coded image
+    segmented_image = color_map[np.argsort(sorted_centers_indices)[labels]].reshape(ndvi_map.shape + (3,))
+    
+    return segmented_image
+
+# --- 3. Main API Endpoint ---
+
+@app.post("/generate-health-map/")
+async def generate_map(rgb_file: UploadFile = File(...), nir_file: UploadFile = File(...)):
+    """
+    Accepts RGB and NIR image uploads, processes them to create a health map,
+    and returns the resulting image.
+    """
     try:
-        exe_path = os.path.join(os.getcwd(), "run_task1.exe")
+        # Read the uploaded image files into memory
+        rgb_contents = await rgb_file.read()
+        nir_contents = await nir_file.read()
 
-        cmd = [exe_path, local_rgb_path, local_nir_path, local_output_path]
-        print(f"Running exe: {' '.join(cmd)}")
-        process = subprocess.run(cmd, capture_output=True, text=True)
+        # Convert the in-memory image data into NumPy arrays using OpenCV
+        rgb_array = cv2.imdecode(np.frombuffer(rgb_contents, np.uint8), cv2.IMREAD_COLOR)
+        nir_array = cv2.imdecode(np.frombuffer(nir_contents, np.uint8), cv2.IMREAD_GRAYSCALE)
 
-        if process.returncode != 0:
-            error_message = f"Execution failed: {process.stderr or process.stdout}"
-            print(f"ERROR: {error_message}")
-            raise HTTPException(status_code=500, detail=error_message)
+        if rgb_array is None or nir_array is None:
+            raise HTTPException(status_code=400, detail="Could not decode one or both of the uploaded images.")
 
-        print("Local exe completed successfully.")
-        return {
-            "message": "Local image processing successful!",
-            "output_saved_to": local_output_path
-        }
-    except Exception as e:
-        print(f"Error during local processing: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # --- Run the Python-based processing pipeline ---
+        # 1. Calculate the NDVI map
+        ndvi_result = calculate_ndvi(rgb_array, nir_array)
+        
+        # 2. Create the final color-coded health map image
+        health_map_image = create_health_map(ndvi_result)
 
-
-# --- 5. Main Supabase Endpoint ---
-@app.post("/generate-stress-map/", dependencies=[Security(get_api_key)])
-async def generate_map(request: ImageProcessRequest):
-    BUCKET_NAME = "vegetation-maps"
-    job_id = str(uuid.uuid4())
-    temp_dir = os.path.join(os.getcwd(), f"temp_{job_id}")
-    os.makedirs(temp_dir, exist_ok=True)
-
-    try:
-        local_rgb_path = os.path.join(temp_dir, "input_rgb.png")
-        local_nir_path = os.path.join(temp_dir, "input_nir.png")
-
-        with open(local_rgb_path, 'wb+') as f:
-            data = supabase.storage.from_(BUCKET_NAME).download(request.rgb_image_path)
-            f.write(data)
-
-        with open(local_nir_path, 'wb+') as f:
-            data = supabase.storage.from_(BUCKET_NAME).download(request.nir_image_path)
-            f.write(data)
-
-        output_filename = f"stress_map_{job_id}.png"
-        local_output_path = os.path.join(temp_dir, output_filename)
-
-        exe_path = r"C:\Users\lundy\OneDrive\Documents\MATLAB\matlab_project\run_task1.exe"  # update path here too
-        cmd = [exe_path, local_rgb_path, local_nir_path, local_output_path]
-        print(f"Running exe: {' '.join(cmd)}")
-        process = subprocess.run(cmd, capture_output=True, text=True)
-
-        if process.returncode != 0:
-            error_message = f"Execution failed: {process.stderr or process.stdout}"
-            print(f"ERROR: {error_message}")
-            raise HTTPException(status_code=500, detail=error_message)
-
-        print("Exe completed successfully.")
-
-        output_storage_path = f"outputs/{output_filename}"
-        with open(local_output_path, 'rb') as f:
-            supabase.storage.from_(BUCKET_NAME).upload(file=f, path=output_storage_path, file_options={"content-type": "image/png"})
-
-        public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(output_storage_path)
-
-        return {
-            "message": "Stress map generated successfully!",
-            "output_url": public_url
-        }
+        # Encode the final image from a NumPy array to a PNG format in memory
+        _, img_encoded = cv2.imencode(".png", health_map_image)
+        
+        # Return the in-memory image data as a streaming response
+        return StreamingResponse(io.BytesIO(img_encoded.tobytes()), media_type="image/png")
 
     except Exception as e:
-        print(f"Unexpected error: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"An unexpected error occurred: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"An error occurred during processing: {str(e)}")
 
-    finally:
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-            print(f"Cleaned up temporary directory: {temp_dir}")
-
-# --- 6. Run FastAPI server ---
+# --- 4. Run FastAPI server for local testing ---
 if __name__ == "__main__":
     uvicorn.run("RUNTASK:app", host="127.0.0.1", port=8000, reload=True)
