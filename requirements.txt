@@ -2,4 +2,5 @@ fastapi
 uvicorn
 numpy
 Pillow
-dotenv
+dotenvs
+supabase
