@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+supabase-py
+python-dotenv
+pydantic
